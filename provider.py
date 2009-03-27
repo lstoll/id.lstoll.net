@@ -59,6 +59,7 @@ from google.appengine.api import datastore
 from google.appengine.api import users
 from google.appengine.ext import webapp
 from google.appengine.ext.webapp import template
+from hashlib import md5
 
 from openid.server import server as OpenIDServer
 import store
@@ -69,6 +70,11 @@ _DEBUG = True
 
 # the global openid server instance
 oidserver = None
+
+def digest(str):
+  m = md5()
+  m.update(str)
+  return m.hexdigest()
 
 def get_op_endpoint(request):
     parsed = urlparse.urlparse(request.uri)
@@ -99,7 +105,7 @@ class Handler(webapp.RequestHandler):
     req = self.request
     return dict([(arg, req.get(arg)) for arg in req.arguments()])
 
-  def HasCookie(self):
+  def HasCookie(self,trust_root):
     """Returns True if we "remember" the user, False otherwise.
 
     Determines whether the user has used OpenID before and asked us to
@@ -109,9 +115,10 @@ class Handler(webapp.RequestHandler):
     Returns:
       True if we remember the user, False otherwise.
     """
+    
     cookies = os.environ.get('HTTP_COOKIE', None)
     if cookies:
-      morsel = Cookie.BaseCookie(cookies).get('openid_remembered')
+      morsel = Cookie.BaseCookie(cookies).get('openid_remembered_%s'%digest(trust_root))
       if morsel and morsel.value == 'yes':
         return True
 
@@ -309,6 +316,8 @@ class Login(Handler):
     logout_url = users.create_logout_url(self.request.uri)
 
     oidrequest = self.GetOpenIdRequest()
+    postargs =  oidrequest.message.toPostArgs() if oidrequest else {}
+    
     if oidrequest is False:
       # there was an error, and GetOpenIdRequest displayed it. bail out.
       return
@@ -316,7 +325,7 @@ class Login(Handler):
       # this is a request from a browser
       self.ShowFrontPage()
     elif oidrequest.mode in ['checkid_immediate', 'checkid_setup']:
-      if self.HasCookie() and user:
+      if self.HasCookie(oidrequest.trust_root) and user:
         logging.debug('Has cookie, confirming identity to ' +
                       oidrequest.trust_root)
         self.store_login(oidrequest, 'remembered')
@@ -375,7 +384,7 @@ class FinishLogin(Handler):
         expires = datetime.datetime.now() + datetime.timedelta(weeks=2)
         expires_rfc822 = expires.strftime('%a, %d %b %Y %H:%M:%S +0000')
         self.response.headers.add_header(
-          'Set-Cookie', 'openid_remembered=yes; expires=%s' % expires_rfc822)
+          'Set-Cookie', 'openid_remembered_%s=yes; expires=%s' % (digest(oidrequest.trust_root),expires_rfc822))
 
       self.store_login(oidrequest, 'confirmed')
       self.Respond(oidrequest.answer(True, server_url=server_url))
