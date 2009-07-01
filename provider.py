@@ -80,17 +80,25 @@ def get_op_endpoint(request):
     parsed = urlparse.urlparse(request.uri)
     request_url_without_path = parsed[0] + '://' + parsed[1]
     request_url_without_params = request_url_without_path + parsed[2]
-    return request_url_without_params
+#    return request_url_without_params
+    return request_url_without_path+'/server'
+
+def get_identity_url(request):
+    user = users.get_current_user()
+    if not user:
+      return None
+      
+    parsed = urlparse.urlparse(request.uri)
+    request_url_without_path = parsed[0] + '://' + parsed[1]
+    
+    return request_url_without_path+'/'+user.nickname()
 
 def InitializeOpenId():
   global oidserver
-  op_endpoint = None
-  """
   name = os.environ.get('SERVER_NAME',None)
   port = os.environ.get('SERVER_PORT','80')
   op_endpoint = "http://%s%s/server"%(name,":%s"%port if port!="80" else "") if name else None
   logging.info('op_endpoint: %s',op_endpoint)
-  """
   oidserver = OpenIDServer.Server(store.DatastoreStore(),op_endpoint = op_endpoint)
   
 class Handler(webapp.RequestHandler):
@@ -169,7 +177,7 @@ class Handler(webapp.RequestHandler):
 #        oidresponse.fields.setArg('http://openid.net/sreg/1.0', 'nickname', user.nickname())
 #        oidresponse.fields.setArg('http://openid.net/sreg/1.0', 'email', user.email())
         pass
-    logging.debug('Using response: %s' % oidresponse)
+    logging.info('Using response: %s' % oidresponse)
     encoded_response = oidserver.encodeResponse(oidresponse)
 
     # update() would be nice, but wsgiref.headers.Headers doesn't implement it
@@ -200,6 +208,9 @@ class Handler(webapp.RequestHandler):
     parsed = urlparse.urlparse(self.request.uri)
     request_url_without_path = parsed[0] + '://' + parsed[1]
     request_url_without_params = request_url_without_path + parsed[2]
+
+    self.response.headers.add_header(
+      'X-XRDS-Location', request_url_without_path+'/xrds')
 
     values = {
       'request': self.request,
@@ -262,16 +273,19 @@ class Handler(webapp.RequestHandler):
     if not user:
       # not logged in!
       return False
-
+#    return True
     # check that the user is logging into their page, not someone else's.
     identity = args['openid.identity']
     parsed = urlparse.urlparse(identity)
     path = parsed[2]
 
+    if identity == 'http://specs.openid.net/auth/2.0/identifier_select':
+      return True
+
     if path[1:] != user.nickname():
       expected = parsed[0] + '://' + parsed[1] + '/' + user.nickname()
-      logging.warning('Bad identity URL %s for user %s; expected %s' %
-                      (identity, user.nickname(), expected))
+      logging.warning('Bad identity URL %s for user %s; expected %s, path:%s' %
+                      (identity, user.nickname(), expected,path))
       return False
 
     logging.debug('User %s matched identity %s' % (user.nickname(), identity))
@@ -287,6 +301,38 @@ class Handler(webapp.RequestHandler):
     front_page.response = self.response
     front_page.get()
 
+
+class XRDS(Handler):
+  def get(self):
+    global oidserver
+    self.response.headers['Content-Type'] = 'application/xrds+xml'
+    self.response.out.write("""\
+<?xml version="1.0" encoding="UTF-8"?>
+<xrds:XRDS xmlns:xrds="xri://$xrds" xmlns="xri://$xrd*($v*2.0)">
+<XRD>
+  <Service priority="0">
+    <Type>http://specs.openid.net/auth/2.0/server</Type>
+    <Type>http://specs.openid.net/auth/2.0/signon</Type>
+    <Type>http://openid.net/srv/ax/1.0</Type>
+    <URI>%(op_endpoint)s</URI>
+  </Service>
+</XRD>
+</xrds:XRDS>"""%{'op_endpoint':oidserver.op_endpoint})
+
+class UserXRDS(Handler):
+  def get(self):
+    global oidserver
+    self.response.headers['Content-Type'] = 'application/xrds+xml'
+    self.response.out.write("""\
+<?xml version="1.0" encoding="UTF-8"?>
+<xrds:XRDS xmlns:xrds="xri://$xrds" xmlns="xri://$xrd*($v*2.0)">
+<XRD>
+  <Service priority="0">
+    <Type>http://specs.openid.net/auth/2.0/signon</Type>
+    <URI>%(op_endpoint)s</URI>
+  </Service>
+</XRD>
+</xrds:XRDS>"""%{'op_endpoint':oidserver.op_endpoint})
 
 class FrontPage(Handler):
   """Show the default OpenID page, with the last 10 logins for this user."""
@@ -308,12 +354,14 @@ class Login(Handler):
 
   def get(self):
     """Handles GET requests."""
+    login_url = users.create_login_url(self.request.uri)
+    logout_url = users.create_logout_url(self.request.uri)
     user = users.get_current_user()
     if user:
       logging.debug('User: %s' % user)
-
-    login_url = users.create_login_url(self.request.uri)
-    logout_url = users.create_logout_url(self.request.uri)
+    else:
+      logging.info('no user, redirect to login url')
+      self.redirect(login_url)
 
     oidrequest = self.GetOpenIdRequest()
     postargs =  oidrequest.message.toPostArgs() if oidrequest else {}
@@ -329,10 +377,10 @@ class Login(Handler):
         logging.debug('Has cookie, confirming identity to ' +
                       oidrequest.trust_root)
         self.store_login(oidrequest, 'remembered')
-        self.Respond(oidrequest.answer(True, server_url=get_op_endpoint(self.request)))
+        self.Respond(oidrequest.answer(True, identity = get_identity_url(self.request)))
       elif oidrequest.immediate:
         self.store_login(oidrequest, 'declined')
-        oidresponse = oidrequest.answer(False, server_url=login_url)
+        oidresponse = oidrequest.answer(False)
         self.Respond(oidresponse)
       else:
         if self.CheckUser():
@@ -361,16 +409,15 @@ class FinishLogin(Handler):
     if not self.CheckUser():
       self.ShowFrontPage()
       return
-
+      
     args = self.ArgsToDict()
 
     try:
+      global oidserver
 #mrk
       from openid.message import Message
       message = Message.fromPostArgs(args)
-      server_url = args['openid.identity']
-      oidrequest = OpenIDServer.CheckIDRequest.fromMessage(message,server_url)
-      logging.debug('server_url:%s',server_url)
+      oidrequest = OpenIDServer.CheckIDRequest.fromMessage(message, oidserver.op_endpoint)
     except:
       trace = ''.join(traceback.format_exception(*sys.exc_info()))
       self.ReportError('Error decoding login request:\n%s' % trace)
@@ -387,13 +434,15 @@ class FinishLogin(Handler):
           'Set-Cookie', 'openid_remembered_%s=yes; expires=%s' % (digest(oidrequest.trust_root),expires_rfc822))
 
       self.store_login(oidrequest, 'confirmed')
-      self.Respond(oidrequest.answer(True, server_url=server_url))
+      answer = oidrequest.answer(True, identity = get_identity_url(self.request))
+      logging.info('answer:%s',answer)
+      self.Respond(answer)
 
     elif args.has_key('no'):
       logging.debug('Login denied, sending cancel to %s' %
                     oidrequest.trust_root)
       self.store_login(oidrequest, 'declined')
-      return self.Respond(oidrequest.answer(False, server_url=server_url))
+      return self.Respond(oidrequest.answer(False))
 
     else:
       self.ReportError('Bad login request.')
@@ -402,8 +451,10 @@ class FinishLogin(Handler):
 # Map URLs to our RequestHandler classes above
 _URLS = [
   ('/', FrontPage),
+  ('/server', Login),
   ('/login', FinishLogin),
-  ('/[^/]*', Login),
+  ('/xrds',XRDS),
+  ('/[^/]*', UserXRDS),
 ]
 
 def main(argv):
